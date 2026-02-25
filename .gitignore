@@ -1,0 +1,22 @@
+# Python stuff
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Streamlit stuff
+.streamlit/
+
+# Data (Optional: ignore if you don't want to host your CSVs publicly)
+*.csv
+*.xlsx
+
+# Reports
+output/
+reports/
+*.pdf
+
+# OS junk
+.DS_Store
+Thumbs.db

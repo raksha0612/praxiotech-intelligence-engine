@@ -28,6 +28,15 @@ from datetime import datetime, timedelta
 # ── Path resolution ───────────────────────────────────────────────────────────────
 _UPLOAD_DIR = "/mnt/user-data/uploads"
 
+def load_and_clean_data():
+    # Find the directory where data_audit.py is located
+    base_path = os.path.dirname(__file__)
+    rest_path = os.path.join(base_path, "restaurants.csv")
+    rev_path = os.path.join(base_path, "reviews.csv")
+    
+    df_rest = _load_restaurants(rest_path)
+    df_rev = _load_reviews(rev_path)
+
 def _resolve_path(filename: str) -> str:
     """Return the first existing path for *filename*; fall back to CWD."""
     candidates = [

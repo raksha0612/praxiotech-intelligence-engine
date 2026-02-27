@@ -1,22 +1,6 @@
 """
 data_audit.py  –  Loads, cleans and enriches restaurant + review CSV data.
-
-ROOT-CAUSE FIX (v1.3):
-  The response-rate was computing correctly in isolation but the app was showing 0%
-  for all restaurants because of a Streamlit @st.cache_data stale-cache issue combined
-  with the CSV files not being found at the relative path.
-
-  Key fixes applied:
-  1. accept_paths() helper: tries CWD first, then the uploads directory automatically,
-     so the app works whether you run from the project folder or the Streamlit cloud dir.
-  2. Response-rate now uses BOTH signals:
-       - owner_response_content (actual text, most reliable)
-       - owner_response flag  ('Antwort vom Inhaber') as fallback
-     A review counts as "responded" if EITHER signal is non-null/non-empty.
-  3. review_rating non-breaking-space strip (was already present, kept).
-  4. _parse_german_date: handles 'Bearbeitet: vor X …' prefix (kept).
-  5. Added cache_clear hint in load_and_clean_data docstring so developers know
-     to call load_data.clear() from app.py when data files change.
+VERSION 1.4: Enhanced Path Resolution for Streamlit Cloud Deployment.
 """
 import os
 import pandas as pd
@@ -24,30 +8,26 @@ import numpy as np
 import re
 from datetime import datetime, timedelta
 
-
 # ── Path resolution ───────────────────────────────────────────────────────────────
-_UPLOAD_DIR = "/mnt/user-data/uploads"
-
-def load_and_clean_data():
-    # Find the directory where data_audit.py is located
-    base_path = os.path.dirname(__file__)
-    rest_path = os.path.join(base_path, "restaurants.csv")
-    rev_path = os.path.join(base_path, "reviews.csv")
-    
-    df_rest = _load_restaurants(rest_path)
-    df_rev = _load_reviews(rev_path)
-
 def _resolve_path(filename: str) -> str:
-    """Return the first existing path for *filename*; fall back to CWD."""
+    """
+    Robust path resolution for local and cloud environments.
+    Checks repo root, script directory, and common data mount points.
+    """
+    # 1. Get the directory where data_audit.py lives
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    
     candidates = [
-        filename,                                    # relative to CWD (normal Streamlit run)
-        os.path.join(os.path.dirname(__file__), filename),  # same dir as this module
-        os.path.join(_UPLOAD_DIR, filename),         # Streamlit/Claude upload dir
+        filename,                                      # Relative to Current Working Dir
+        os.path.join(module_dir, filename),           # Relative to this script
+        os.path.join("/mount/src/praxiotech-intelligence-engine", filename), # Streamlit Default
     ]
+    
     for p in candidates:
-        if os.path.isfile(p):
+        if os.path.exists(p):
             return p
-    # Return the CWD path so pandas raises a clear FileNotFoundError
+            
+    # Fallback to returning the filename so pandas raises a clear error with the attempted path
     return filename
 
 
@@ -56,20 +36,30 @@ def load_and_clean_data(
     restaurants_path: str = "restaurants.csv",
     reviews_path:     str = "reviews.csv",
 ):
-    """Load, clean and enrich both CSVs.  Call load_data.clear() in app.py
-    (the cached wrapper) whenever the underlying files change."""
-    restaurants_path = _resolve_path(restaurants_path)
-    reviews_path     = _resolve_path(reviews_path)
+    """
+    Load, clean and enrich both CSVs. 
+    Matches the signature expected by app.py.
+    """
+    # Resolve absolute paths before passing to loaders
+    abs_rest_path = _resolve_path(restaurants_path)
+    abs_rev_path  = _resolve_path(reviews_path)
 
-    df_rest = _load_restaurants(restaurants_path)
-    df_rev  = _load_reviews(reviews_path)
+    df_rest = _load_restaurants(abs_rest_path)
+    df_rev  = _load_reviews(abs_rev_path)
+    
+    # Enrichment logic
     df_rest = _enrich_restaurants(df_rest, df_rev)
     benchmarks = _compute_benchmarks(df_rest)
+    
     return df_rest, df_rev, benchmarks
 
 
 # ── Restaurant loader ─────────────────────────────────────────────────────────────
 def _load_restaurants(path: str) -> pd.DataFrame:
+    # Ensure path exists before reading
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Critical Error: Data file not found at {path}")
+        
     df = pd.read_csv(path, encoding="utf-8-sig")
 
     rating_col = find_col(df, ["rating"])
@@ -99,15 +89,16 @@ def _load_restaurants(path: str) -> pd.DataFrame:
 
 # ── Review loader ─────────────────────────────────────────────────────────────────
 def _load_reviews(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Critical Error: Review data not found at {path}")
+        
     df = pd.read_csv(path, encoding="utf-8-sig")
 
-    # Date parsing – prefer review_date column
     date_col = find_col(df, ["review_date", "date", "review_time", "reviewer_data"])
     df["normalized_date"] = (
         df[date_col].apply(_parse_german_date) if date_col else datetime.now()
     )
 
-    # Rating – strip non-breaking spaces before numeric conversion
     rating_col = find_col(df, ["review_rating", "rating", "stars", "review_c"])
     if rating_col:
         df["review_rating"] = pd.to_numeric(
@@ -128,11 +119,6 @@ def _enrich_restaurants(df_rest: pd.DataFrame, df_rev: pd.DataFrame) -> pd.DataF
     r_url = find_col(df_rest, ["page_url", "url", "link"])
     v_url = find_col(df_rev,  ["page_url", "url", "link"])
 
-    # ── Response-rate signal columns ──────────────────────────────────────────────
-    # We use BOTH available columns and count a review as "responded" when EITHER
-    # contains a non-empty value.  This handles:
-    #   • owner_response_content  – actual reply text (best signal)
-    #   • owner_response          – flag string 'Antwort vom Inhaber'  (fallback)
     resp_content_col = find_col(df_rev, ["owner_response_content"])
     resp_flag_col    = find_col(df_rev, ["owner_response"])
 
@@ -151,9 +137,6 @@ def _enrich_restaurants(df_rest: pd.DataFrame, df_rev: pd.DataFrame) -> pd.DataF
             if sub is None or len(sub) == 0:
                 continue
 
-            # ── Response rate ─────────────────────────────────────────────────────
-            # A review is "responded" when the content column is non-null/non-empty
-            # OR the flag column says 'Antwort vom Inhaber' (or any non-null value).
             responded = pd.Series([False] * len(sub), index=sub.index)
 
             if resp_content_col and resp_content_col in sub.columns:
@@ -174,11 +157,9 @@ def _enrich_restaurants(df_rest: pd.DataFrame, df_rev: pd.DataFrame) -> pd.DataF
 
             rates[slug] = responded.sum() / len(sub)
 
-            # ── Sentiment ─────────────────────────────────────────────────────────
             if "review_rating" in sub.columns:
                 sm[slug] = ((sub["review_rating"].mean() - 1) / 4.0) * 100
 
-            # ── Recency score ─────────────────────────────────────────────────────
             if "normalized_date" in sub.columns:
                 d = pd.to_datetime(sub["normalized_date"])
                 rm[slug] = min(
@@ -193,7 +174,6 @@ def _enrich_restaurants(df_rest: pd.DataFrame, df_rev: pd.DataFrame) -> pd.DataF
         df_rest["recency_score"] = df_rest["_slug"].map(rm).fillna(0.5)
 
     else:
-        # Fallback when URL columns are missing
         np.random.seed(42)
         df_rest["res_rate"]      = np.random.beta(2, 3, size=len(df_rest))
         df_rest["sentiment"]     = ((df_rest["rating_n"] - 1) / 4.0) * 100
@@ -217,7 +197,6 @@ def _compute_benchmarks(df_rest: pd.DataFrame) -> dict:
 
 # ── Public helpers ────────────────────────────────────────────────────────────────
 def find_col(df: pd.DataFrame, candidates: list) -> str | None:
-    """Case-insensitive column lookup. Returns actual column name or None."""
     col_map = {c.lower(): c for c in df.columns}
     for c in candidates:
         if c.lower() in col_map:
@@ -226,12 +205,6 @@ def find_col(df: pd.DataFrame, candidates: list) -> str | None:
 
 
 def _url_slug(url: str) -> str:
-    """Extract the restaurant place-name slug from a Google Maps URL.
-
-    Pattern shared by both short and long URLs:  /place/<NAME>/@
-    e.g. '.../place/Im+Herzen+Afrikas+Frankfurt/@50.10...'
-         → 'im+herzen+afrikas+frankfurt'
-    """
     m = re.search(r"/place/([^/@]+)", str(url))
     return m.group(1).lower() if m else str(url).lower()[:80]
 
@@ -242,7 +215,6 @@ def _parse_int(x) -> int:
 
 
 def _parse_german_date(date_str) -> datetime:
-    """Parse German relative date strings, including 'Bearbeitet: vor X …' prefix."""
     today = datetime.now()
     s = str(date_str).lower()
     s = re.sub(r"^bearbeitet:\s*", "", s).strip()
